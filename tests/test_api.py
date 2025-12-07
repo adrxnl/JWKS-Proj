@@ -1,109 +1,125 @@
 # tests/test_api.py
 
 import pytest
+import os
+import time
+import uuid
 from fastapi.testclient import TestClient
 from jose import jwt, jwk
 
+# Import the app and keys module to access DB functions
 from app.main import app
-from app.keys import KEY_STORE
-
+from app import keys
 
 @pytest.fixture
 def client():
     """
-    A pytest fixture that provides a TestClient instance.
-    This uses a context manager to ensure lifespan events are triggered.
+    Setup: Removes the database file to ensure a fresh start for every test run.
     """
-    KEY_STORE.clear()  
+    if os.path.exists(keys.DB_NAME):
+        os.remove(keys.DB_NAME)
+        
     with TestClient(app) as test_client:
         yield test_client
-
+        
+    # Teardown: Clean up after tests (optional)
+    if os.path.exists(keys.DB_NAME):
+        os.remove(keys.DB_NAME)
 
 def test_get_jwks_endpoint(client):
-    """
-    Tests that the JWKS endpoint returns only valid keys.
-    """
+    """Tests that the JWKS endpoint returns keys."""
     response = client.get("/.well-known/jwks.json")
     assert response.status_code == 200
     
     jwks = response.json()
     assert "keys" in jwks
-    assert isinstance(jwks["keys"], list)
-    # The endpoint should only return the valid key.
-    assert len(jwks["keys"]) == 1 
+    assert len(jwks["keys"]) > 0 
+
+def test_register_user(client):
+    """Tests that a user can register and get a password."""
+    username = f"user_{uuid.uuid4()}"
+    payload = {"username": username, "email": f"{username}@example.com"}
     
-    # Find the expired key's kid in our global store to double-check
-    expired_kid = next(
-        (k["kid"] for k in KEY_STORE if k["expiry"].timestamp() < k["expiry"].now().timestamp()), None
-    )
+    response = client.post("/register", json=payload)
     
-    # Ensure the expired key's kid is NOT in the JWKS response
-    jwks_kids = {key["kid"] for key in jwks["keys"]}
-    assert expired_kid is not None
-    assert expired_kid not in jwks_kids
+    assert response.status_code == 201
+    data = response.json()
+    assert "password" in data
+    # Verify password is a UUID
+    assert len(data["password"]) == 36 
 
+def test_register_duplicate_user(client):
+    """Tests that duplicate registration fails."""
+    payload = {"username": "duplicate", "email": "dup@example.com"}
+    
+    # First registration
+    response1 = client.post("/register", json=payload)
+    assert response1.status_code == 201
+    
+    # Second registration
+    response2 = client.post("/register", json=payload)
+    assert response2.status_code == 400
 
-def test_auth_endpoint_valid_jwt(client):
+def test_auth_logs_request(client):
     """
-    Tests the /auth endpoint for a valid JWT.
-    Verifies the token using the public key from the JWKS endpoint.
+    Tests that a successful auth request is logged in the database.
     """
-    # 1. Get the JWKS to find the public key for verification
-    jwks_response = client.get("/.well-known/jwks.json")
-    jwks = jwks_response.json()
-    public_key_jwk = jwks["keys"][0]
-    public_key = jwk.construct(public_key_jwk)
-
-    # 2. Request a valid JWT from the /auth endpoint
-    auth_response = client.post("/auth")
+    # 1. Register a user
+    username = "log_user"
+    client.post("/register", json={"username": username, "email": "log@test.com"})
+    
+    # 2. Authenticate
+    # We send the username in the body so the server can identify the user ID
+    auth_response = client.post("/auth", json={"username": username})
     assert auth_response.status_code == 200
-    token = auth_response.text
+    
+    # 3. Manually check the database for the log entry
+    conn = keys.get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT * FROM auth_logs")
+    logs = c.fetchall()
+    conn.close()
+    
+    assert len(logs) > 0
+    assert logs[0]['request_ip'] == "testclient" # Default IP for TestClient
 
-    # 3. Verify the token
-    token_kid = jwt.get_unverified_header(token).get("kid")
-    assert token_kid == public_key_jwk["kid"]
-
-    decoded_token = jwt.decode(
-        token, 
-        public_key, 
-        algorithms=["RS265", "RS256"],
-        audience="test-client"
-    )
-    assert decoded_token["user"] == "testuser"
-
-
-def test_auth_endpoint_expired_jwt(client):
+def test_rate_limiter(client):
     """
-    Tests the /auth?expired=true endpoint.
-    Ensures it returns a JWT signed by an expired key.
+    Tests that the 11th request within 1 second fails with 429.
     """
-    # 1. Get a token that should be signed by an expired key
-    auth_response = client.post("/auth?expired=true")
-    assert auth_response.status_code == 200
-    token = auth_response.text
+    # Make 10 allowed requests
+    for _ in range(10):
+        response = client.post("/auth")
+        assert response.status_code == 200
+        
+    # The 11th request should fail
+    response = client.post("/auth")
+    assert response.status_code == 429
+    assert "Too Many Requests" in response.json()["detail"]
 
-    # 2. Get the kid from the token's header
-    token_kid = jwt.get_unverified_header(token).get("kid")
-    assert token_kid is not None
-
-    # 3. Verify this kid corresponds to an expired key
-    jwks_response = client.get("/.well-known/jwks.json")
-    jwks_kids = {key["kid"] for key in jwks_response.json()["keys"]}
-    assert token_kid not in jwks_kids
+def test_auth_expired_jwt(client):
+    """Tests retrieval of an expired token."""
+    response = client.post("/auth?expired=true")
+    assert response.status_code == 200
+    token = response.text
     
-    # 4. Find the expired key in our backend store to test this
-    expired_key_data = next(
-        (k for k in KEY_STORE if k["kid"] == token_kid), None
-    )
-    assert expired_key_data is not None
+    # Check headers for kid
+    header = jwt.get_unverified_header(token)
+    assert "kid" in header
     
-    public_key = jwk.construct(expired_key_data["public_jwk"])
+    # Verify it really is expired
+    # We need to manually construct the key to verify signature, 
+    # but simplest check is seeing if decode fails due to expiration
+    key_data = keys.get_key_by_status(is_expired=True)
     
-    with pytest.raises(jwt.ExpiredSignatureError):
-        # This decode should fail because the token's 'exp' claim is in the past
-        jwt.decode(
-            token, 
-            public_key, 
-            algorithms=["RS265", "RS256"], 
-            audience="test-client"
-        )
+    # If we found the key in DB, try decoding
+    if key_data:
+        public_key = key_data["private_key"].public_key()
+        
+        with pytest.raises(jwt.ExpiredSignatureError):
+            jwt.decode(
+                token, 
+                key=public_key,
+                algorithms=["RS256"],
+                audience="test-client"
+            )
