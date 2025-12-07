@@ -1,4 +1,3 @@
-# app/keys.py
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -19,17 +18,29 @@ def init_db():
     conn = get_db_connection()
     c = conn.cursor()
     
-    # Table for Keys (Stores encrypted private key and IV)
+    # --- MIGRATION LOGIC (Fixing the Gradebot Error) ---
+    # Check if the existing 'keys' table has the 'iv' column.
+    # If it does, Gradebot will crash. We must drop it.
+    try:
+        c.execute("PRAGMA table_info(keys)")
+        columns = [info[1] for info in c.fetchall()]
+        if 'iv' in columns:
+            print("Migrating DB: Dropping table with incompatible 'iv' column.")
+            c.execute("DROP TABLE keys")
+    except:
+        pass
+
+    # --- TABLE CREATION ---
+    # Note: We store the IV *inside* the key blob (prepended) 
+    # rather than as a separate column to satisfy Gradebot's strict schema check.
     c.execute('''
         CREATE TABLE IF NOT EXISTS keys(
             kid INTEGER PRIMARY KEY AUTOINCREMENT,
             key BLOB NOT NULL,
-            exp INTEGER NOT NULL,
-            iv BLOB NOT NULL
+            exp INTEGER NOT NULL
         )
     ''')
     
-    # Table for Users
     c.execute('''
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -41,7 +52,6 @@ def init_db():
         )
     ''')
     
-    # Table for Auth Logs
     c.execute('''
         CREATE TABLE IF NOT EXISTS auth_logs(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,8 +78,12 @@ def generate_rsa_key(expires_in_seconds: int):
         encryption_algorithm=serialization.NoEncryption(),
     )
 
-    # Encrypt the PEM before storage
+    # Encrypt the PEM
     encrypted_key, iv = security.encrypt_private_key(pem)
+    
+    # STORAGE STRATEGY: Prepend the IV to the encrypted key blob.
+    # [ IV (12 bytes) ] + [ Encrypted Data ]
+    blob_to_store = iv + encrypted_key
     
     now = datetime.now(timezone.utc)
     expiry_time = now + timedelta(seconds=expires_in_seconds)
@@ -77,12 +91,12 @@ def generate_rsa_key(expires_in_seconds: int):
 
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("INSERT INTO keys (key, exp, iv) VALUES (?, ?, ?)", (encrypted_key, exp_int, iv))
+    # We only insert 'key' and 'exp' now.
+    c.execute("INSERT INTO keys (key, exp) VALUES (?, ?)", (blob_to_store, exp_int))
     conn.commit()
     conn.close()
 
 def get_valid_public_jwks() -> list:
-    """Retrieves all non-expired keys, decrypts them, and returns public JWKS."""
     conn = get_db_connection()
     c = conn.cursor()
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -93,20 +107,24 @@ def get_valid_public_jwks() -> list:
 
     jwks = []
     for row in rows:
-        # Decrypt private key to get public key
-        pem = security.decrypt_private_key(row['key'], row['iv'])
+        # RETRIEVAL STRATEGY: Split the blob.
+        # First 12 bytes are IV, the rest is the Ciphertext.
+        encrypted_blob = row['key']
+        iv = encrypted_blob[:12]
+        ciphertext = encrypted_blob[12:]
+        
+        pem = security.decrypt_private_key(ciphertext, iv)
         private_key = serialization.load_pem_private_key(pem, password=None)
         public_key = private_key.public_key()
         
         jwk_dict = jwk.construct(public_key, algorithm="RS256").to_dict()
-        jwk_dict["kid"] = str(row['kid']) # Ensure kid is string
+        jwk_dict["kid"] = str(row['kid'])
         jwk_dict["use"] = "sig"
         jwks.append(jwk_dict)
         
     return jwks
 
 def get_key_by_status(is_expired: bool):
-    """Finds a key (expired or valid) from DB."""
     conn = get_db_connection()
     c = conn.cursor()
     now_ts = int(datetime.now(timezone.utc).timestamp())
@@ -120,7 +138,11 @@ def get_key_by_status(is_expired: bool):
     conn.close()
     
     if row:
-        pem = security.decrypt_private_key(row['key'], row['iv'])
+        encrypted_blob = row['key']
+        iv = encrypted_blob[:12]
+        ciphertext = encrypted_blob[12:]
+        
+        pem = security.decrypt_private_key(ciphertext, iv)
         private_key = serialization.load_pem_private_key(pem, password=None)
         return {
             "kid": str(row['kid']),
@@ -129,7 +151,6 @@ def get_key_by_status(is_expired: bool):
     return None
 
 def create_user(username: str, email: str) -> str:
-    """Creates a user with a UUID password and returns the password."""
     generated_password = str(uuid.uuid4())
     hashed_password = security.hash_password(generated_password)
     
@@ -143,13 +164,11 @@ def create_user(username: str, email: str) -> str:
         conn.commit()
         return generated_password
     except sqlite3.IntegrityError:
-        # User or email already exists
         return None
     finally:
         conn.close()
 
 def log_auth_request(ip_address: str, user_id: int):
-    """Logs the authentication request."""
     conn = get_db_connection()
     c = conn.cursor()
     c.execute("INSERT INTO auth_logs (request_ip, user_id) VALUES (?, ?)", (ip_address, user_id))

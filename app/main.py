@@ -1,31 +1,36 @@
-# app/main.py
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Response, Request, status
+from fastapi import FastAPI, HTTPException, Response, Request
 from pydantic import BaseModel
-from collections import deque
 import time
+from collections import deque  # <--- ADD THIS IMPORT
 from . import keys, security
 
-# Simple in-memory rate limiter using a sliding window
+# RATE LIMITER: Sliding Window Log
+# We store the timestamp of each request. 
+# On a new request, we remove timestamps older than 1 second.
+# If the remaining count is >= limit, we block.
 request_timestamps = deque()
 
-def is_rate_limited(limit=10, window_seconds=1):
+def is_rate_limited(limit: int = 10, window_seconds: int = 1) -> bool:
+    global request_timestamps
     now = time.time()
-    # Remove timestamps older than the window
-    while request_timestamps and request_timestamps[0] < now - window_seconds:
+    
+    # 1. Clean up: Remove timestamps older than our window
+    while request_timestamps and now - request_timestamps[0] > window_seconds:
         request_timestamps.popleft()
     
+    # 2. Check Limit: If we still have 10 or more items, we are full
     if len(request_timestamps) >= limit:
         return True
     
+    # 3. Allow: Add the current timestamp
     request_timestamps.append(now)
     return False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize DB (create tables)
     keys.init_db()
-    # Generate keys
+    # Generate keys so JWKS is populated
     keys.generate_rsa_key(expires_in_seconds=3600)
     keys.generate_rsa_key(expires_in_seconds=-3600)
     yield
@@ -36,64 +41,52 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Pydantic model for user registration
 class UserRegister(BaseModel):
     username: str
     email: str
 
 @app.post("/register", status_code=201)
 async def register_user(user: UserRegister):
-    password = keys.create_user(user.username, user.email)
-    if not password:
-        raise HTTPException(status_code=400, detail="Username or Email already exists.")
-    
-    return {"password": password}
+    try:
+        password = keys.create_user(user.username, user.email)
+        if not password:
+            raise HTTPException(status_code=400, detail="Username or Email already exists.")
+        return {"password": password}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/auth")
 async def authenticate_and_get_jwt(request: Request, expired: bool = False):
     # 1. Rate Limiting Check
-    if is_rate_limited():
-        raise HTTPException(
-            status_code=429, 
-            detail="Too Many Requests"
-        )
+    if is_rate_limited(limit=10, window_seconds=1):
+        raise HTTPException(status_code=429, detail="Too Many Requests")
 
     # 2. Key Selection
     key_to_use = keys.get_key_by_status(is_expired=expired)
     if not key_to_use:
         raise HTTPException(status_code=500, detail="No key found.")
     
-    # 3. Handle Logging (If a user is authenticated)
-    # NOTE: The requirements say "For each POST:/auth request, log... User ID".
-    # This implies we should try to identify the user if credentials are provided.
+    # 3. Log the request (Try to get User ID)
     user_id = None
-    
-    # Try to parse JSON body for login credentials (optional but needed for logging ID)
     try:
         body = await request.json()
         if "username" in body:
-            # NOTE: For this assignment, we just need the ID for logging.
-            # In a real app, you would verify the password here using security.verify_password
-            # For now, we will just look up the ID if you implemented a helper, 
-            # or just log a dummy ID if not strictly requiring login for Part 2.
-            # Let's assuming the logging requirement expects a valid User ID from the DB.
             conn = keys.get_db_connection()
             row = conn.execute("SELECT id FROM users WHERE username = ?", (body["username"],)).fetchone()
             conn.close()
             if row:
                 user_id = row['id']
     except:
-        pass # Ignore if no JSON body (Part 1 backward compatibility)
+        pass 
 
     # 4. Generate Token
     token = security.create_jwt(key_to_use, expired)
     
-    # 5. Log the request (only if successful)
+    # 5. Log to DB (Requirement: Only requests that succeed should be logged)
     if user_id:
         keys.log_auth_request(request.client.host, user_id)
     
     return Response(content=token, media_type="text/plain")
-
 
 @app.get("/.well-known/jwks.json")
 async def get_jwks():
